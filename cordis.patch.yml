@@ -1,0 +1,5 @@
+# dsh-plugin-ai-gateway bundle patch.
+# 插件自带的挂载层：insert 一条 loader 条目即可。
+- insert:
+    - id: ai-gateway
+      name: 'dsh-plugin-ai-gateway'
