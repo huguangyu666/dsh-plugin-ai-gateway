@@ -31,6 +31,14 @@
     "gateway"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huguangyu666/dsh-plugin-ai-gateway.git"
+  },
+  "homepage": "https://github.com/huguangyu666/dsh-plugin-ai-gateway#readme",
+  "bugs": {
+    "url": "https://github.com/huguangyu666/dsh-plugin-ai-gateway/issues"
+  },
   "engines": {
     "node": ">=22.5"
   },
