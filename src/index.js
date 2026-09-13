@@ -868,6 +868,7 @@ export function apply(ctx, initialConfig) {
           return sendJSON(res, 200, await stopGateway())
         }
         if (sub === '/gateway/restart') {
+          userStopped = false
           const stopped = await stopGateway()
           const started = await ensureRunning()
           return sendJSON(res, 200, { stopped, started })
@@ -1109,6 +1110,86 @@ export function apply(ctx, initialConfig) {
       ? ctx.webServer.register({ kind: 'prefix', path: '/agy-gateway', handler })
       : null
 
+    // ---- 智能自愈 1：事前防御（在每一个 Agent 步骤开始前，保证反代网关端口在线）
+    const disposePreStep = ctx.on?.('agent/pre-step', async ({ agent, signal }, next) => {
+      try {
+        if (config.autoStart !== false && !userStopped) {
+          if (!(await isReady())) {
+            await ensureRunningQuietly('pre-step')
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      return next ? next() : Promise.resolve(void 0)
+    })
+
+    // ---- 智能自愈 2：事中兜底（遇到 Connection error / 503 / 504 / i/o timeout 自动拉起 + 重试）
+    const recoveryAttempts = new Map()
+    const disposeRequestError = ctx.on?.('agent/request-error', async (payload, next) => {
+      const { provider, failure, turn, step, signal } = payload || {}
+      const isOurProvider = provider === config.dshProviderId
+        || provider === 'agy-gateway'
+        || provider === 'ai-gateway'
+        || provider === 'codex-gateway'
+
+      if (!isOurProvider || signal?.aborted) {
+        return next ? next() : Promise.resolve(void 0)
+      }
+
+      const msg = String(failure?.message || '')
+      const isConnectionError = msg.includes('Connection error')
+        || msg.includes('ECONNREFUSED')
+        || msg.includes('connectex')
+        || msg.includes('i/o timeout')
+        || msg.includes('503')
+        || msg.includes('504')
+
+      if (!isConnectionError) {
+        return next ? next() : Promise.resolve(void 0)
+      }
+
+      const key = `${turn}:${step}`
+      const attempts = recoveryAttempts.get(key) ?? 0
+      if (attempts >= 2) {
+        return next ? next() : Promise.resolve(void 0)
+      }
+      recoveryAttempts.set(key, attempts + 1)
+
+      ctx.logger?.warn?.(`[ai-gateway] 检测到模型请求异常 (${msg.slice(0, 100)})，正在自动拉起/自愈重试 (${attempts + 1}/2)...`)
+
+      // 1. 如果端口离线，立刻拉起网关
+      if (!(await isReady())) {
+        await ensureRunningQuietly('request-error-recovery')
+      }
+
+      // 2. 如果网关在线但上游报 503 / 冷却中，向管理面清除运行时冷却标记
+      try {
+        const st = readState()
+        if (st?.managementKey) {
+          const afRes = await probeJSON(`${base()}/v0/management/auth-files`, mgmtHeaders(), 2000)
+          for (const f of afRes.body?.files || []) {
+            if (f.auth_index && (f.unavailable || f.status !== 'active')) {
+              await fetch(`${base()}/v0/management/reset-quota`, {
+                method: 'POST',
+                headers: { ...mgmtHeaders(), 'content-type': 'application/json' },
+                body: JSON.stringify({ auth_index: f.auth_index }),
+                signal: AbortSignal.timeout(3000),
+              }).catch(() => {})
+            }
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+
+      // 等待 800ms 让连接稳定
+      await sleep(800)
+
+      // 返回 { kind: 'retry' }，触发 DSH 内部自动重跑该步骤！
+      return { kind: 'retry' }
+    })
+
     // 插件加载后稍等再拉网关（别和 DSH 自己的启动抢资源），之后由看门狗兜底
     const bootTimer = setTimeout(() => { void ensureRunningQuietly('plugin-load') }, 2500)
     if (typeof bootTimer.unref === 'function') bootTimer.unref()
@@ -1129,6 +1210,8 @@ export function apply(ctx, initialConfig) {
         clearTimeout(quotaPreheat)
         clearInterval(quotaTimer)
         clearInterval(watchdog)
+        disposePreStep?.()
+        disposeRequestError?.()
       } catch {
         /* ignore */
       }
