@@ -59,9 +59,9 @@ export const Config = Schema.object({
     .description('出海代理地址（auto 自动对齐系统代理/Clash/v2rayN，可手动填写如 http://127.0.0.1:7890，填 direct 为直连/TUN）'),
   probeTimeoutMs: Schema.number().default(3000).description('单次探测超时'),
   startTimeoutMs: Schema.number().default(20000).description('等待网关进入就绪的最长时间'),
-  enableZCode: Schema.boolean().default(true).description('是否启用 ZCode / GLM 本地反代能力'),
+  enableZCode: Schema.boolean().default(false).description('是否启用 ZCode / GLM 本地反代能力'),
   zcodePort: Schema.number().default(8325).description('ZCode 本地独立反代端口'),
-  zcodeStandalone: Schema.boolean().default(true).description('是否启动独立本地端口服务供外部客户端连接'),
+  zcodeStandalone: Schema.boolean().default(false).description('是否启动独立本地端口服务供外部客户端连接'),
 })
 
 // ---------------------------------------------------------------- 基础读取
