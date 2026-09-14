@@ -26,7 +26,7 @@ DeepSeek Harness 官方生态插件：**本地多渠道 AI 聚合反代网关可
   * `GLM-5.2`、`GLM-5-Turbo`、`GLM-4.7`、`GLM-4.6`；
   * 原生支持 OpenAI 与 Anthropic 协议双向互转，流式 `reasoning_content` 与 `tool_calls`；
   * **官方客户端指纹**：上游请求完整复刻 ZCode 3.12.1 身份头（`User-Agent: ZCode/3.12.1`、`X-Title: Z Code@electron`、`X-Platform`、`X-Os-Category`、`X-Client-Language/Timezone`、`X-Device-Mid` 取自本机真实遥测等）；
-  * **计费通道说明**（逆向 app.asar + 实测结论）：日常消息调用走 `open.bigmodel.cn/api/anthropic` 的裸 API Key 计费通道（`service_tier: standard`，消耗套餐额度）；官方的免费通道是"**闲时任务**"（Off-Peak）：仅限 Coding Plan 订阅用户、走 `zcode.z.ai` 网关 + `zcodejwttoken` 鉴权 + 票据排队（`/api/v1/off-peak/ticket`），官方明示"免费、不消耗套餐额度"。闲时票据链路已全链路验证（领票/排队/状态查询均 200）。
+  * **计费通道说明**（逆向 app.asar + 实测）：日常消息调用走 `open.bigmodel.cn/api/anthropic` 的裸 API Key 计费通道（`service_tier: standard`，消耗套餐额度）。客户端另有专属免费通道（如"闲时任务"官方文案明示免费不耗额度），但其服务端校验（`zcode.z.ai` 网关 + `zcodejwttoken` + 票据/验证码）无法在纯服务端复刻，本插件不涉足，日常使用请直接用官方 ZCode 客户端。
 
 ### 2. 👥 多账号智能轮换池与故障转移 (Failover)
 * **负载均衡**：多个 Google 或 OpenAI 账号自动按 `round-robin` 轮流调度，成倍扩充 5 小时内可用并发；
