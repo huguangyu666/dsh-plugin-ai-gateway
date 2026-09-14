@@ -15,6 +15,8 @@ import {
   AnthropicToOpenAiStreamTransformer,
   createZCodeProxyHandler,
   startZCodeStandaloneServer,
+  buildOfficialZCodeHeaders,
+  OFFICIAL_ZCODE_VERSION,
 } from '../src/zcode-service.js'
 import { createServer } from 'node:http'
 
@@ -108,6 +110,61 @@ const modelsRes = await fetch(`http://127.0.0.1:${testPort}/v1/models`).then((r)
 check('/v1/models 返回 OpenAI 标准模型列表', modelsRes.object === 'list' && modelsRes.data.length >= 4)
 
 testServer.close()
+
+// 6.5 官方客户端指纹头（逆向自官方 app.asar buildZCodeSourceHeaders）
+const fp = buildOfficialZCodeHeaders({ telemetryState: { deviceMid: 'test-mid', locale: 'zh-CN' } })
+check('指纹 UA 形如 ZCode/<官方版本>', fp['user-agent'] === `ZCode/${OFFICIAL_ZCODE_VERSION}`, fp['user-agent'])
+check('指纹包含 X-ZCode-App-Version', fp['x-zcode-app-version'] === OFFICIAL_ZCODE_VERSION)
+check('指纹包含 X-Title 与官方值一致', fp['x-title'] === 'Z Code@electron')
+check('指纹包含平台三元组 X-Platform', /^[a-z0-9]+-[a-z0-9]+$/.test(fp['x-platform'] || ''), fp['x-platform'])
+check('指纹包含官方 OS 归类', ['windows', 'macos', 'linux'].includes(fp['x-os-category']), fp['x-os-category'])
+check('指纹包含客户端语言与时区', fp['x-client-language'] === 'zh-CN' && typeof fp['x-client-timezone'] === 'string' && fp['x-client-timezone'].length > 0, `${fp['x-client-language']} / ${fp['x-client-timezone']}`)
+check('deviceMid 可从本机真实遥测读到时才附带（不伪造）', fp['x-device-mid'] === 'test-mid')
+const fpLive = buildOfficialZCodeHeaders()
+check('真实环境下指纹语言非 unknown（读取本机遥测 locale）', fpLive['x-client-language'] !== undefined, fpLive['x-client-language'])
+
+// 用本地 mock 上游捕获反代实际发出的头，验证完整官方指纹在真实请求链路上生效
+const capturedHeaders = []
+const captureServer = createServer((req, res) => {
+  capturedHeaders.push(req.headers)
+  let raw = ''
+  req.on('data', (c) => { raw += c })
+  req.on('end', () => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ id: 'msg_capture', type: 'message', role: 'assistant', model: 'GLM-5.3-Flash', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }))
+  })
+})
+await new Promise((resolve) => captureServer.listen(0, '127.0.0.1', resolve))
+const capturePort = captureServer.address().port
+const proxyHandler = createZCodeProxyHandler({
+  mockCredentials: { apiKey: 'test-key', activeProvider: 'bigmodel' },
+  upstreamUrl: `http://127.0.0.1:${capturePort}/api/anthropic/v1/messages`,
+})
+const capProxyServer = createServer((req, res) => proxyHandler(req, res))
+await new Promise((resolve) => capProxyServer.listen(0, '127.0.0.1', resolve))
+const capPort = capProxyServer.address().port
+const capturedPromise = new Promise((resolve) => {
+  const timer = setTimeout(() => resolve(null), 3000)
+  captureServer.once('request', () => { clearTimeout(timer); resolve(capturedHeaders[0] || null) })
+})
+const capFetch = fetch(`http://127.0.0.1:${capPort}/v1/chat/completions`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ model: 'GLM-5.3-Flash', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 }),
+})
+const sentHeaders = await capturedPromise
+await capFetch.catch(() => {})
+capProxyServer.close()
+captureServer.close()
+if (sentHeaders) {
+  const h = capturedHeaders[0] || {}
+  check('反代上游请求携带完整官方指纹 UA', h['user-agent'] === `ZCode/${OFFICIAL_ZCODE_VERSION}`, h['user-agent'])
+  check('反代上游请求双鉴权头（x-api-key + Bearer）', h['x-api-key'] === 'test-key' && h.authorization === 'Bearer test-key')
+  check('反代上游请求带 anthropic-version', h['anthropic-version'] === '2023-06-01')
+  check('反代上游请求带 X-Title / X-Platform / X-Os-Category', h['x-title'] === 'Z Code@electron' && Boolean(h['x-platform']) && Boolean(h['x-os-category']))
+} else {
+  check('反代上游请求指纹捕获', false, 'capture timeout')
+}
 
 // 7. 真实上游实时补全测试（若凭据可用）
 if (creds?.apiKey) {

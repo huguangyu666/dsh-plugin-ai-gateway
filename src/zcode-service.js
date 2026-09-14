@@ -9,7 +9,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { homedir, platform, userInfo } from 'node:os'
+import { arch, homedir, platform, userInfo } from 'node:os'
 import { join } from 'node:path'
 
 const CIPHER_ALGO = 'aes-256-gcm'
@@ -21,6 +21,93 @@ export const DEFAULT_BIGMODEL_UPSTREAM = 'https://open.bigmodel.cn/api/anthropic
 export const DEFAULT_ZAI_UPSTREAM = 'https://api.z.ai/api/anthropic/v1/messages'
 export const DEFAULT_ZCODE_PORT = 8325
 const MAX_BODY_BYTES = 32 * 1024 * 1024
+
+// ---------------------------------------------------------------------------
+// 官方 ZCode 客户端指纹头（逐字段逆向自官方 app.asar 的 buildZCodeSourceHeaders）
+// 让反代上游请求在 HTTP 身份层面与真实 ZCode 桌面客户端一致。
+// ---------------------------------------------------------------------------
+
+/** 官方客户端真实版本号（与 ZCode.exe 的 ProductVersion 对齐）。 */
+export const OFFICIAL_ZCODE_VERSION = '3.12.1'
+
+function osCategory(plat) {
+  if (plat === 'darwin') return 'macos'
+  if (plat === 'win32') return 'windows'
+  return 'linux'
+}
+
+/** 官方 osVersion 取自 process.getSystemVersion()（Node 18+ 可用）；取不到则不发送该头。 */
+function resolveOsVersion() {
+  try {
+    if (typeof process.getSystemVersion === 'function') {
+      const v = process.getSystemVersion()
+      if (typeof v === 'string' && v.trim()) return v.trim()
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+/** 客户端语言：官方从遥测状态读取 locale；这里读取同一来源，取不到回退 unknown。 */
+function resolveClientLanguage(telemetry) {
+  const locale = telemetry?.locale
+  if (typeof locale === 'string' && locale.trim()) return locale.trim()
+  return 'unknown'
+}
+
+function resolveClientTimezone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+    if (typeof tz === 'string' && tz.trim()) return tz.trim()
+  } catch {
+    /* ignore */
+  }
+  return 'unknown'
+}
+
+/**
+ * 构造与官方客户端完全一致的身份头集合。
+ * 返回小写 header 名（与 fetch headers 对象一致）。
+ * deviceMid 仅在能从本机真实遥测状态读到时附带，绝不伪造。
+ */
+export function buildOfficialZCodeHeaders(options = {}) {
+  const plat = options.platform || platform()
+  const version = options.version || OFFICIAL_ZCODE_VERSION
+  const telemetry = options.telemetryState || readZCodeTelemetryState()
+
+  const headers = {
+    'user-agent': `ZCode/${version}`,
+    'x-zcode-app-version': version,
+    'x-title': 'Z Code@electron',
+    // 官方默认 io = "https://zcode.z.ai"（端点 origin 常量），kft/withZCodeEndpointHeaders 会将其重写为实际端点 origin。
+    'http-referer': options.endpointOrigin || 'https://zcode.z.ai',
+    'x-client-language': resolveClientLanguage(telemetry),
+    'x-client-timezone': resolveClientTimezone(),
+    'x-os-category': osCategory(plat),
+  }
+  if (plat && arch()) headers['x-platform'] = `${plat}-${arch()}`
+  const osVersion = resolveOsVersion()
+  if (osVersion) headers['x-os-version'] = osVersion
+  // 官方 stable 渠道不发送 x-release-channel（仅 beta/dev 渠道带），保持一致故省略。
+  if (telemetry?.deviceMid) headers['x-device-mid'] = telemetry.deviceMid
+  return headers
+}
+
+/** 读取本机 ZCode 遥测状态（deviceMid 与 locale 的官方来源）。 */
+function readZCodeTelemetryState() {
+  try {
+    const p = join(homedir(), '.zcode', 'v2', 'telemetry-state.json')
+    if (!existsSync(p)) return null
+    const parsed = JSON.parse(readFileSync(p, 'utf8'))
+    return {
+      deviceMid: typeof parsed?.deviceMid === 'string' ? parsed.deviceMid : null,
+      locale: typeof parsed?.locale === 'string' ? parsed.locale : null,
+    }
+  } catch {
+    return null
+  }
+}
 
 export const KNOWN_GLM_MODELS = new Map([
   ['glm-5.3', 'GLM-5.3'],
@@ -670,9 +757,9 @@ export function createZCodeProxyHandler(options = {}) {
           headers: {
             'content-type': 'application/json',
             'x-api-key': apiKey,
+            authorization: `Bearer ${apiKey}`,
             'anthropic-version': '2023-06-01',
-            'user-agent': 'ZCode/3.12.1',
-            'x-zcode-app-version': '3.12.1',
+            ...buildOfficialZCodeHeaders(options),
           },
           body: JSON.stringify(anthropicReq),
           signal: controller.signal,
