@@ -429,6 +429,21 @@ function AgyGatewaySection() {
     await load();
   }, [plan, load]);
 
+  /** 一键接入 ZCode / 智谱 BigModel Coding Plan */
+  const applyZCodeProvider = useCallback(async () => {
+    if (!window.confirm("将把 ZCode / 智谱 BigModel 写入 DSH 模型提供商（zcode-gateway，含 GLM-5.3、GLM-5.3-Flash 等）。\n不会改动你已有的其它 provider。继续？")) return;
+    setAct("接入 ZCode");
+    setNote("");
+    try {
+      const d = await api("/provider/apply", "POST", { target: "zcode" });
+      setNote("✅ 已接入 ZCode：" + d.providerId + " · " + d.models + " 个模型（GLM-5.3 / GLM-5.3-Flash 等已就绪）");
+    } catch (e) {
+      setNote("接入 ZCode：❌ " + (e.message || String(e)));
+    }
+    setAct("");
+    await load();
+  }, [load]);
+
   if (err) {
     return h("div", { style: S.wrap },
       h("div", { style: { ...S.row, ...S.bad } }, "读取网关状态失败：" + err),
@@ -590,6 +605,26 @@ function AgyGatewaySection() {
             : h("div", { style: { marginTop: "10px" } },
                 h(Btn, { onClick: applyProvider, disabled: busy }, busy === "一键接入" ? "写入中…" : "一键接入（自动写 provider + 密钥）"),
                 h("div", { style: S.hint }, "会用上面的参数与 " + (plan.models || []).length + " 个模型写入 DSH 设置（深合并，不动其它 provider），网关密钥存入 DSH 凭据库。")))
+      : null,
+
+    // —— ZCode / 智谱 BigModel Coding Plan 接入卡片 ——
+    st.zcode && st.zcode.enabled
+      ? h("div", { style: { ...S.card, marginTop: "14px" } },
+          h("div", { style: S.cardLabel }, "ZCode / 智谱 BigModel Coding Plan (内置支持)"),
+          h("div", { style: S.row },
+            h("span", { style: S.label }, "凭据状态"),
+            h("span", { style: S.mono }, st.zcode.ready ? ("✅ 已自动解密 (" + (st.zcode.keyMasked || "") + ")") : "❌ 未检测到本机凭据（先在 ZCode 客户端登录）")),
+          h("div", { style: S.row },
+            h("span", { style: S.label }, "独立服务地址"),
+            h("span", { style: S.mono }, st.zcode.url || "—")),
+          h("div", { style: S.row },
+            h("span", { style: S.label }, "可用模型"),
+            h("span", { style: S.mono }, (st.zcode.models || []).join("、"))),
+          st.zcode.ready
+            ? h("div", { style: { marginTop: "10px" } },
+                h(Btn, { onClick: applyZCodeProvider, disabled: busy }, busy === "接入 ZCode" ? "写入中…" : "一键接入 DSH（添加 zcode-gateway）"),
+                h("div", { style: S.hint }, "写入后 DSH 模型列表将出现 zcode-gateway，支持 GLM-5.3、GLM-5.3-Flash 思维链推理与工具调用；外部工具（Cursor/NextChat）亦可直连独立服务地址。"))
+            : null)
       : null,
 
     h("div", { style: S.hint },

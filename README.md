@@ -19,6 +19,12 @@ DeepSeek Harness 官方生态插件：**本地多渠道 AI 聚合反代网关可
   * `GPT-5.6 Sol（旗舰深度推理）`、`GPT-5.6 Terra（全能平衡主力）`、`GPT-5.6 Luna（极速代码补全）`
   * `GPT-5.5`、`GPT-6 Astra`、`GPT-5.3 Codex Spark`、`Codex Auto Review`
   * `o1`、`o3-mini`、`GPT-4o`
+* **ZCode / 智谱 BigModel Coding Plan 通道 (内置驱动)**：
+  * 自动解密本机 `~/.zcode/v2/credentials.json` 秘钥，零配置白嫖 Coding Plan 额度；
+  * `GLM-5.3` (旗舰深度思考·支持思维链推理与工具调用)；
+  * `GLM-5.3-Flash` (极速高并发代码模型·毫秒级流式响应)；
+  * `GLM-5.2`、`GLM-5-Turbo`、`GLM-4.7`、`GLM-4.6`；
+  * 原生支持 OpenAI 与 Anthropic 协议双向互转，流式 `reasoning_content` 与 `tool_calls`。
 
 ### 2. 👥 多账号智能轮换池与故障转移 (Failover)
 * **负载均衡**：多个 Google 或 OpenAI 账号自动按 `round-robin` 轮流调度，成倍扩充 5 小时内可用并发；

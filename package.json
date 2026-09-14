@@ -59,8 +59,8 @@
   "scripts": {
     "build": "node build.mjs",
     "prepack": "node build.mjs",
-    "test": "node tools/redline-check.mjs && node tools/edge-case-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs",
-    "verify": "node build.mjs && node tools/redline-check.mjs && node tools/edge-case-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs"
+    "test": "node tools/redline-check.mjs && node tools/edge-case-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs && node tools/zcode-test.mjs",
+    "verify": "node build.mjs && node tools/redline-check.mjs && node tools/edge-case-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs && node tools/zcode-test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh": ">=0.1.2-rc.1",

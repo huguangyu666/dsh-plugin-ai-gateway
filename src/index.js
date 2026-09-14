@@ -11,11 +11,17 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync,
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 import { defaultPaths, inspectTextFile, writeHardenedConfig, resolveProxyUrlSync, syncProxyUrlInConfigFile } from './config-writer.js'
 import { summarizeUsage } from './usage-summary.js'
 import { fetchAllAccountsQuota, consumeCodexResetCredit } from './quota-service.js'
+import {
+  loadZCodeCredentials,
+  listSupportedGlmModels,
+  createZCodeProxyHandler,
+  startZCodeStandaloneServer,
+} from './zcode-service.js'
 
 export const name = 'ai-gateway'
 
@@ -53,6 +59,9 @@ export const Config = Schema.object({
     .description('出海代理地址（auto 自动对齐系统代理/Clash/v2rayN，可手动填写如 http://127.0.0.1:7890，填 direct 为直连/TUN）'),
   probeTimeoutMs: Schema.number().default(3000).description('单次探测超时'),
   startTimeoutMs: Schema.number().default(20000).description('等待网关进入就绪的最长时间'),
+  enableZCode: Schema.boolean().default(true).description('是否启用 ZCode / GLM 本地反代能力'),
+  zcodePort: Schema.number().default(8325).description('ZCode 本地独立反代端口'),
+  zcodeStandalone: Schema.boolean().default(true).description('是否启动独立本地端口服务供外部客户端连接'),
 })
 
 // ---------------------------------------------------------------- 基础读取
@@ -278,7 +287,7 @@ export const LEGACY_SETTINGS_NS = 'agy-gateway'
 const LLM_NAMESPACE = 'llm-pi-ai'
 
 /** 可由界面编辑的字段白名单（routePrefix 改动需要重启，故只读）。 */
-const EDITABLE_FIELDS = ['port', 'releaseVersion', 'allowRemoteControl', 'autoStart', 'proxyUrl', 'probeTimeoutMs', 'startTimeoutMs', 'binPath', 'configPath', 'statePath', 'authDir', 'downloadDir']
+const EDITABLE_FIELDS = ['port', 'releaseVersion', 'allowRemoteControl', 'autoStart', 'proxyUrl', 'probeTimeoutMs', 'startTimeoutMs', 'binPath', 'configPath', 'statePath', 'authDir', 'downloadDir', 'enableZCode', 'zcodePort', 'zcodeStandalone']
 
 // Gemini 上游（Vertex thinking_level）没有 xhigh 档，CLIProxyAPI 会原样透传并被 400 拒绝：
 // 选择器里保留 Xhigh 档但发送值一律钳到 high；没配档位表的 gemini 模型补一份安全默认。
@@ -308,6 +317,10 @@ function validateResolvedConfig(value) {
   }
   if (value?.proxyUrl !== undefined && typeof value.proxyUrl !== 'string') {
     throw new Error('proxyUrl 必须为字符串')
+  }
+  if (value?.zcodePort !== undefined) {
+    const zp = Number(value.zcodePort)
+    if (!Number.isInteger(zp) || zp < 1 || zp > 65535) throw new Error('zcodePort 必须是 1..65535 的整数')
   }
 }
 
@@ -518,7 +531,7 @@ export function apply(ctx, initialConfig) {
     }
     try {
       if (IS_WIN) {
-        spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+        spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
       } else {
         process.kill(pid, 'SIGTERM')
       }
@@ -526,9 +539,10 @@ export function apply(ctx, initialConfig) {
       return { stopped: false, error: err instanceof Error ? err.message : String(err) }
     }
     const deadline = Date.now() + 8000
-    while (Date.now() < deadline && pidAlive(pid)) await sleep(200)
+    while (Date.now() < deadline && (pidAlive(pid) || (await isReady()))) await sleep(150)
     clearRuntime()
-    return { stopped: !pidAlive(pid), pid, adoptedExternal: adopted, stillAlive: pidAlive(pid) }
+    const stopped = !pidAlive(pid) && !(await isReady())
+    return { stopped, pid, adoptedExternal: adopted, stillAlive: !stopped }
   }
 
   function startLogin(targetProvider = 'antigravity') {
@@ -653,10 +667,33 @@ export function apply(ctx, initialConfig) {
     const mgmt = await probeJSON(`${base()}/v0/management/config`, mgmtHeaders(), config.probeTimeoutMs)
     out.gateway.management = mgmt.ok ? 'ok' : mgmt.status === 401 ? 'unauthorized' : 'unreachable'
     out.gateway.version = await versionOf(config.binPath)
+
+    let zcodeInfo = {
+      enabled: config.enableZCode !== false,
+      ready: false,
+      models: [],
+      url: null,
+    }
+    if (config.enableZCode !== false) {
+      const zcCreds = loadZCodeCredentials()
+      zcodeInfo = {
+        enabled: true,
+        ready: Boolean(zcCreds?.apiKey),
+        provider: zcCreds?.activeProvider || 'bigmodel',
+        keyMasked: zcCreds?.apiKey ? `${zcCreds.apiKey.slice(0, 8)}...${zcCreds.apiKey.slice(-6)}` : null,
+        models: listSupportedGlmModels().map((m) => m.id),
+        url: config.zcodeStandalone !== false ? `http://127.0.0.1:${config.zcodePort ?? 8325}/v1` : `${base()}${prefix}/zcode/v1`,
+      }
+    }
+    out.zcode = zcodeInfo
     return out
   }
 
   // ---------------------------------------------------------------- HTTP 路由
+
+  const zcodeHandler = createZCodeProxyHandler({
+    timeoutMs: config.probeTimeoutMs ? Math.max(config.probeTimeoutMs, 60000) : 180000,
+  })
 
   const sendJSON = (res, code, body) => {
     const payload = JSON.stringify(body)
@@ -696,6 +733,13 @@ export function apply(ctx, initialConfig) {
         .replace(/^\/api(?=\/|$)/, '')
         .replace(/\/+$/, '') || '/'
       const method = req.method ?? 'GET'
+
+      // ---- ZCode 反向代理路由匹配 (/zcode/* 或 /zcode/v1/*) ----
+      if (config.enableZCode !== false && (sub === '/zcode' || sub.startsWith('/zcode/'))) {
+        const zSub = sub.slice('/zcode'.length) || '/'
+        const handled = await zcodeHandler(req, res, zSub)
+        if (handled) return
+      }
 
       // —— 只读 ——
       if (method === 'GET') {
@@ -963,6 +1007,47 @@ export function apply(ctx, initialConfig) {
           if (typeof settings?.update !== 'function' || typeof settings?.get !== 'function') {
             return sendJSON(res, 503, { error: '设置服务未挂载或不可写，无法写 provider' })
           }
+
+          // 如果请求要求写入 ZCode 模型
+          if (body?.target === 'zcode') {
+            const zcCreds = loadZCodeCredentials()
+            if (!zcCreds?.apiKey) {
+              return sendJSON(res, 400, { error: '未检测到 ZCode 登录凭据，请先在 ZCode 客户端登录' })
+            }
+            const zcodePort = config.zcodePort ?? 8325
+            const zcodeBaseURL = config.zcodeStandalone !== false ? `http://127.0.0.1:${zcodePort}/v1` : `${base()}${prefix}/zcode/v1`
+            const zcodeProviderId = 'zcode-gateway'
+            const zcodeRef = 'ZCODE_GATEWAY_API_KEY'
+            const credentials = credentialsOf()
+            if (typeof credentials?.set === 'function') {
+              try {
+                await credentials.set(await toCredentialRef(zcodeRef), zcCreds.apiKey)
+              } catch {
+                /* ignore credential set error */
+              }
+            }
+            const zcodeModels = listSupportedGlmModels()
+            const providerDef = {
+              api: 'openai-completions',
+              baseURL: zcodeBaseURL,
+              apiKeyEnv: zcodeRef,
+              compat: { thinkingFormat: 'openai' },
+              models: zcodeModels,
+            }
+            try {
+              await settings.update(LLM_NAMESPACE, { providers: { [zcodeProviderId]: providerDef } })
+            } catch (err) {
+              return sendJSON(res, 400, { error: `写入 ZCode 设置失败：${err instanceof Error ? err.message : String(err)}` })
+            }
+            return sendJSON(res, 200, {
+              ok: true,
+              providerId: zcodeProviderId,
+              baseURL: zcodeBaseURL,
+              models: zcodeModels.length,
+              note: '已成功将 ZCode / GLM 模型写入 DSH 模型提供商（zcode-gateway）！',
+            })
+          }
+
           const credentials = credentialsOf()
           if (typeof credentials?.set !== 'function') {
             return sendJSON(res, 503, { error: '凭据服务未挂载，无法安全存放网关密钥（不提供该服务的部署请手填密钥）' })
@@ -1110,7 +1195,51 @@ export function apply(ctx, initialConfig) {
       ? ctx.webServer.register({ kind: 'prefix', path: '/agy-gateway', handler })
       : null
 
-    // ---- 智能自愈 1：事前防御（在每一个 Agent 步骤开始前，保证反代网关端口在线）
+    let zcodeStandaloneServer = null
+    if (config.enableZCode !== false && config.zcodeStandalone !== false) {
+      const zp = config.zcodePort ?? 8325
+      startZCodeStandaloneServer({ port: zp, host: '127.0.0.1' })
+        .then((srv) => {
+          zcodeStandaloneServer = srv
+          ctx.logger?.info?.(`[ai-gateway] ZCode 独立反代已就绪：${srv.url}`)
+        })
+        .catch(() => {})
+    }
+
+    // 辅助函数：解除所有被临时判错/冷却的账号锁定
+    async function unlockStaleAccounts(reason = 'watchdog') {
+      try {
+        const st = readState()
+        if (!st?.managementKey) return
+        const afRes = await probeJSON(`${base()}/v0/management/auth-files`, mgmtHeaders(), 2500)
+        const files = afRes.body?.files || []
+        let unlocked = 0
+        for (const f of files) {
+          if (!f.auth_index || f.disabled) continue
+          const isError = f.status === 'error' || f.status !== 'active' || f.unavailable
+          if (isError) {
+            const msg = String(f.status_message || f.statusMessage || '')
+            const isHardBan = msg.includes('deactivated') || msg.includes('terminated')
+            if (!isHardBan) {
+              await fetch(`${base()}/v0/management/reset-quota`, {
+                method: 'POST',
+                headers: { ...mgmtHeaders(), 'content-type': 'application/json' },
+                body: JSON.stringify({ auth_index: f.auth_index }),
+                signal: AbortSignal.timeout(3000),
+              }).catch(() => {})
+              unlocked++
+            }
+          }
+        }
+        if (unlocked > 0) {
+          ctx.logger?.info?.(`[ai-gateway] 已自动解冻 ${unlocked} 个受上游临时错误影响的账号 (${reason})`)
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // ---- 智能自愈 1：事前防御（在每一个 Agent 步骤开始前，保证反代网关端口在线且账号未被误冻）
     const disposePreStep = ctx.on?.('agent/pre-step', async ({ agent, signal }, next) => {
       try {
         if (config.autoStart !== false && !userStopped) {
@@ -1118,13 +1247,14 @@ export function apply(ctx, initialConfig) {
             await ensureRunningQuietly('pre-step')
           }
         }
+        await unlockStaleAccounts('pre-step')
       } catch {
         /* ignore */
       }
       return next ? next() : Promise.resolve(void 0)
     })
 
-    // ---- 智能自愈 2：事中兜底（遇到 Connection error / 503 / 504 / i/o timeout 自动拉起 + 重试）
+    // ---- 智能自愈 2：事中兜底（遇到 503 / 504 / 500 / auth_unavailable / overloaded 优先解冻 + 智能退避重试）
     const recoveryAttempts = new Map()
     const disposeRequestError = ctx.on?.('agent/request-error', async (payload, next) => {
       const { provider, failure, turn, step, signal } = payload || {}
@@ -1138,57 +1268,49 @@ export function apply(ctx, initialConfig) {
       }
 
       const msg = String(failure?.message || '')
-      const isConnectionError = msg.includes('Connection error')
+      const code = String(failure?.code || '')
+      const isConnectionOrServerError = msg.includes('Connection error')
         || msg.includes('ECONNREFUSED')
         || msg.includes('connectex')
         || msg.includes('i/o timeout')
         || msg.includes('503')
         || msg.includes('504')
+        || msg.includes('500')
+        || msg.includes('502')
+        || msg.includes('auth_unavailable')
+        || msg.includes('server_is_overloaded')
+        || msg.includes('server_error')
+        || code === 'SERVER'
+        || code === 'TIMEOUT'
 
-      if (!isConnectionError) {
+      if (!isConnectionOrServerError) {
         return next ? next() : Promise.resolve(void 0)
       }
 
       const key = `${turn}:${step}`
       const attempts = recoveryAttempts.get(key) ?? 0
-      if (attempts >= 2) {
+      if (attempts >= 3) {
         return next ? next() : Promise.resolve(void 0)
       }
       recoveryAttempts.set(key, attempts + 1)
 
-      ctx.logger?.warn?.(`[ai-gateway] 检测到模型请求异常 (${msg.slice(0, 100)})，正在自动拉起/自愈重试 (${attempts + 1}/2)...`)
+      ctx.logger?.warn?.(`[ai-gateway] 检测到模型请求异常 (${msg.slice(0, 120)})，正在自动拉起/解冻自愈 (${attempts + 1}/3)...`)
 
       // 1. 如果端口离线，立刻拉起网关
       if (!(await isReady())) {
         await ensureRunningQuietly('request-error-recovery')
       }
 
-      // 2. 如果网关在线但上游报 503 / 冷却中，向管理面清除运行时冷却标记
-      try {
-        const st = readState()
-        if (st?.managementKey) {
-          const afRes = await probeJSON(`${base()}/v0/management/auth-files`, mgmtHeaders(), 2000)
-          for (const f of afRes.body?.files || []) {
-            if (f.auth_index && (f.unavailable || f.status !== 'active')) {
-              await fetch(`${base()}/v0/management/reset-quota`, {
-                method: 'POST',
-                headers: { ...mgmtHeaders(), 'content-type': 'application/json' },
-                body: JSON.stringify({ auth_index: f.auth_index }),
-                signal: AbortSignal.timeout(3000),
-              }).catch(() => {})
-            }
-          }
-        }
-      } catch {
-        /* ignore */
-      }
+      // 2. 解冻所有被上游临时报错误杀的账号
+      await unlockStaleAccounts('request-error')
 
-      // 等待 800ms 让连接稳定
-      await sleep(800)
+      // 3. 递增等待，给上游留出冷却缓冲（首次 1s，二次 2s，三次 3s）
+      const backoffMs = attempts === 0 ? 1000 : (attempts === 1 ? 2000 : 3000)
+      await sleep(backoffMs)
 
       // 返回 { kind: 'retry' }，触发 DSH 内部自动重跑该步骤！
       return { kind: 'retry' }
-    })
+    }, true)
 
     // 插件加载后稍等再拉网关（别和 DSH 自己的启动抢资源），之后由看门狗兜底
     const bootTimer = setTimeout(() => { void ensureRunningQuietly('plugin-load') }, 2500)
@@ -1201,7 +1323,10 @@ export function apply(ctx, initialConfig) {
     if (typeof quotaTimer.unref === 'function') quotaTimer.unref()
 
     const watchdogMs = Math.max(Number(config.watchdogIntervalMs) || 60000, 15000)
-    const watchdog = setInterval(() => { void ensureRunningQuietly('watchdog') }, watchdogMs)
+    const watchdog = setInterval(() => {
+      void ensureRunningQuietly('watchdog')
+      void unlockStaleAccounts('watchdog')
+    }, watchdogMs)
     if (typeof watchdog.unref === 'function') watchdog.unref()
 
     return () => {
@@ -1212,6 +1337,10 @@ export function apply(ctx, initialConfig) {
         clearInterval(watchdog)
         disposePreStep?.()
         disposeRequestError?.()
+        if (zcodeStandaloneServer) {
+          zcodeStandaloneServer.close().catch(() => {})
+          zcodeStandaloneServer = null
+        }
       } catch {
         /* ignore */
       }
