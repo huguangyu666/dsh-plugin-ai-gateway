@@ -15,7 +15,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 import { defaultPaths, inspectTextFile, writeHardenedConfig, resolveProxyUrlSync, syncProxyUrlInConfigFile } from './config-writer.js'
 import { summarizeUsage } from './usage-summary.js'
-import { fetchAllAccountsQuota, consumeCodexResetCredit } from './quota-service.js'
+import { fetchAllAccountsQuota, consumeCodexResetCredit, parseQuotaExhausted, recordRateLimitSignal } from './quota-service.js'
 import {
   loadZCodeCredentials,
   listSupportedGlmModels,
@@ -1407,6 +1407,27 @@ export function apply(ctx, initialConfig) {
 
       const msg = String(failure?.message || '')
       const code = String(failure?.code || '')
+
+      // 额度耗尽（429）：官方账本是异步批处理的，实测会滞后于真实消耗
+      // （出现过面板 100% 但请求已 QUOTA_EXHAUSTED）。真实报文里的
+      // quotaResetTimeStamp 是权威的，捕获后立刻纠正面板，不再让用户看错数。
+      const quotaHit = parseQuotaExhausted(msg)
+      if (quotaHit) {
+        try {
+          const sig = recordRateLimitSignal({ model: quotaHit.model, resetTimeIso: quotaHit.resetTimeIso })
+          if (sig) {
+            ctx.logger?.warn?.(
+              `[ai-gateway] 实测触发额度上限（${quotaHit.model || '未知模型'}）：面板已标记为 0%，` +
+              `${sig.bucket === 'h5' ? '5 小时' : '周'}额度将于 ${sig.hoursAway.toFixed(2)} 小时后恢复`
+            )
+          }
+        } catch {
+          /* 信号记录失败不影响错误正常上抛 */
+        }
+        // 额度耗尽不做自动重试：立刻重试只会再次 429，交给用户决策。
+        return next ? next() : Promise.resolve(void 0)
+      }
+
       const isConnectionOrServerError = msg.includes('Connection error')
         || msg.includes('ECONNREFUSED')
         || msg.includes('connectex')

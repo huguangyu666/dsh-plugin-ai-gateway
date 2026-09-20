@@ -356,6 +356,91 @@ const cacheMap = new Map()
 const CACHE_FRESH_MS = 25000 // 25s 内视作新鲜
 const CACHE_MAX_STALE_MS = 120000 // 2 分钟内可作为 SWR 旧数据立刻返回
 
+// ---------------------------------------------------------------------------
+// 实测限流信号（Rate-Limit Signal）
+//
+// 为什么需要它：官方 `retrieveUserQuotaSummary` 是异步批处理账本，存在明显滞后。
+// 实测复现过「面板显示 100%，但请求立刻 429 QUOTA_EXHAUSTED」——账本没跟上消耗。
+// 而真实 429 报文里带有权威的 `quotaResetTimeStamp`，比滞后账本可信得多。
+// 因此捕获 429 后立刻覆盖对应桶为 0%，并在 reset 时刻自动失效。
+//
+// 归属说明：429 报文不携带账号身份，无法定位到具体账号；故按池级信号处理，
+// 覆盖该 provider 下全部账号。单账号场景下这等价于精确归属。
+// ---------------------------------------------------------------------------
+const rateLimitSignals = new Map() // key('*' | `email:xxx`) -> { group, bucket, resetAt, model, at }
+
+/** 从 429 报文里提取权威的重置时刻与模型名。 */
+export function parseQuotaExhausted(message) {
+  const msg = String(message || '')
+  if (!/429|QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED/i.test(msg)) return null
+  const ts = msg.match(/"quotaResetTimeStamp"\s*:\s*"([^"]+)"/)
+  if (!ts) return null
+  const model = msg.match(/"model"\s*:\s*"([^"]+)"/)
+  const resetAt = Date.parse(ts[1])
+  if (!Number.isFinite(resetAt)) return null
+  return { resetTimeIso: ts[1], model: model ? model[1] : '' }
+}
+
+/**
+ * 记录一次实测限流：把权威 reset 时刻写成池级信号，直到该时刻自动失效。
+ * @returns {{group: string, bucket: string, resetAt: number, hoursAway: number} | null}
+ */
+export function recordRateLimitSignal({ model, resetTimeIso, email } = {}) {
+  const resetAt = Date.parse(String(resetTimeIso || ''))
+  if (!Number.isFinite(resetAt)) return null
+  const hoursAway = (resetAt - Date.now()) / 3_600_000
+  // 5 小时桶的重置必然落在 5 小时内；周桶重置在数天之后，据此判定归属。
+  const bucket = hoursAway <= 6 ? 'h5' : 'weekly'
+  const group = /claude|gpt|opus|sonnet|3p/i.test(String(model || '')) ? 'claude' : 'gemini'
+  const key = email ? `email:${String(email).toLowerCase()}` : '*'
+  rateLimitSignals.set(key, { group, bucket, resetAt, model: String(model || ''), at: Date.now() })
+  return { group, bucket, resetAt, hoursAway }
+}
+
+/** 当前活跃的池级限流信号（过期即自动清理）。 */
+export function activeRateLimitSignals() {
+  const now = Date.now()
+  for (const [key, sig] of rateLimitSignals) {
+    if (now >= sig.resetAt) rateLimitSignals.delete(key)
+  }
+  return [...rateLimitSignals.values()]
+}
+
+/**
+ * 把实测信号叠加到官方账本结果上：信号存在时以 0% 覆盖对应桶。
+ * 不修改缓存本身，只在读取路径上生效，因此刷新面板即可立刻看到真实状态。
+ */
+function applySignals(data) {
+  if (!data || data.provider !== 'antigravity') return data
+  const emailKey = data.email ? `email:${String(data.email).toLowerCase()}` : null
+  const sig = (emailKey && rateLimitSignals.get(emailKey)) || rateLimitSignals.get('*')
+  if (!sig) return data
+  if (Date.now() >= sig.resetAt) {
+    rateLimitSignals.delete(emailKey || '*')
+    return data
+  }
+  const resetIso = new Date(sig.resetAt).toISOString()
+  const bucket = {
+    fraction: 0,
+    percent: 0,
+    resetTime: resetIso,
+    countdown: formatResetCountdown(resetIso),
+    desc: `实测已达上限（${sig.model || '未知模型'}）；官方账本尚未同步`,
+    source: 'rate-limit-signal',
+  }
+  return {
+    ...data,
+    [sig.group]: { ...data[sig.group], [sig.bucket]: bucket },
+    rateLimitSignal: {
+      group: sig.group,
+      bucket: sig.bucket,
+      resetAt: resetIso,
+      model: sig.model,
+      poolLevel: true,
+    },
+  }
+}
+
 export async function fetchAllAccountsQuota(authDir, forceFresh = false) {
   if (!existsSync(authDir)) return []
   const files = readdirSync(authDir).filter((f) => f.toLowerCase().endsWith('.json'))
@@ -369,7 +454,7 @@ export async function fetchAllAccountsQuota(authDir, forceFresh = false) {
       return c && now - c.timestamp < CACHE_FRESH_MS
     })
     if (allFresh && files.length > 0) {
-      return files.map((f) => cacheMap.get(f).data).filter(Boolean)
+      return files.map((f) => applySignals(cacheMap.get(f).data)).filter(Boolean)
     }
 
     // 2. SWR (Stale-While-Revalidate): 如果有陈旧缓存，先直接把旧缓存返回给前端，后台异步拉最新数据！
@@ -388,7 +473,7 @@ export async function fetchAllAccountsQuota(authDir, forceFresh = false) {
         )
       })()
       // 立刻返回现有内存缓存
-      return files.map((f) => cacheMap.get(f)?.data).filter(Boolean)
+      return files.map((f) => applySignals(cacheMap.get(f)?.data)).filter(Boolean)
     }
   }
 
@@ -404,5 +489,5 @@ export async function fetchAllAccountsQuota(authDir, forceFresh = false) {
     })
   )
 
-  return results.filter(Boolean)
+  return results.map((data) => applySignals(data)).filter(Boolean)
 }

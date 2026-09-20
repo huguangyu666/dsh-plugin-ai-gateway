@@ -108,16 +108,32 @@ async function api(path, method, body) {
 function QuotaBar({ label, bucket }) {
   const pct = bucket && typeof bucket.percent === "number" ? bucket.percent : null;
   const countdown = bucket?.countdown || "—";
+  const measured = bucket?.source === "rate-limit-signal";
   const tone = pct === null ? DSW("label-tertiary", "#9ca3af") : pct < 15 ? C_BAD : pct < 40 ? C_WARN : C_OK;
   const width = pct === null ? "0%" : Math.min(Math.max(pct, 0), 100) + "%";
 
   return h("div", { style: { margin: "8px 0 12px" } },
     h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", fontSize: "13px" } },
-      h("span", { style: { color: DSW("label-secondary"), fontWeight: 600 } }, label),
+      h("span", { style: { color: DSW("label-secondary"), fontWeight: 600 } },
+        label,
+        measured ? h("span", {
+          style: {
+            marginLeft: "6px",
+            fontSize: "10px",
+            padding: "1px 5px",
+            borderRadius: "4px",
+            background: C_BAD,
+            color: "#fff",
+            fontWeight: 600,
+            verticalAlign: "middle"
+          }
+        }, "实测") : null),
       h("span", { style: { color: tone, fontWeight: 700, fontSize: "14px" } }, pct !== null ? pct + "%" : "—")),
     h("div", { style: { height: "8px", background: DSW("border-l2", "#eef2f6"), borderRadius: "999px", overflow: "hidden", margin: "6px 0 5px" } },
       h("div", { style: { width, height: "100%", background: tone, borderRadius: "999px", transition: "width 0.3s ease" } })),
-    h("div", { style: { fontSize: "11.5px", color: DSW("label-tertiary"), fontFamily: "ui-monospace, Consolas, monospace" } }, countdown));
+    h("div", { style: { fontSize: "11.5px", color: DSW("label-tertiary"), fontFamily: "ui-monospace, Consolas, monospace" } }, countdown),
+    measured ? h("div", { style: { fontSize: "11px", color: C_BAD, marginTop: "3px", lineHeight: 1.5 } },
+      "该桶来自请求实测 429，比官方账本更可信；官方账本同步后会自动回到官方值。") : null);
 }
 
 /** 从上游报错文本里挖出关键链接（账号验证 / 了解更多），供面板直接点。 */
@@ -195,6 +211,25 @@ function AccountQuotaCard({ acc, mgmt, onReset, onDelete, onConsumeReset, busy }
   const links = extractLinks(mgmt?.statusMessage);
   const runtimeBad = mgmt && (mgmt.unavailable || (mgmt.status && mgmt.status !== 'active' && mgmt.status !== 'ready'));
   return h("div", { style: { ...S.card, margin: "10px 0", padding: "14px 16px" } },
+    acc.rateLimitSignal
+      ? h("div", {
+          style: {
+            marginBottom: "12px",
+            padding: "9px 12px",
+            borderRadius: "8px",
+            border: "1px solid " + C_BAD,
+            background: "rgba(239,68,68,0.08)",
+            fontSize: "12px",
+            lineHeight: 1.6,
+            color: DSW("label-primary")
+          }
+        },
+        h("b", { style: { color: C_BAD } }, "⚠ 实测额度已耗尽（官方账本滞后）"),
+        h("div", { style: { marginTop: "3px", color: DSW("label-secondary") } },
+          "触发模型 " + (acc.rateLimitSignal.model || "未知") +
+          "；" + (acc.rateLimitSignal.bucket === "h5" ? "5 小时额度" : "周额度") +
+          "将于 " + (acc.rateLimitSignal.resetAt ? acc.rateLimitSignal.resetAt.replace("T", " ").slice(0, 16) + " UTC" : "—") + " 恢复。"))
+      : null,
     h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid " + DSW("border-l2"), paddingBottom: "10px", marginBottom: "12px", flexWrap: "wrap", gap: "8px" } },
       h("div", { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } },
         h("span", { style: { fontWeight: 600, fontSize: "13.5px" } }, acc.email || acc.fileName),
