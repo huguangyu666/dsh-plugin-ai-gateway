@@ -53,6 +53,9 @@ export const Config = Schema.object({
   autoStart: Schema.boolean()
     .default(true)
     .description('插件加载时自动拉起网关，并在它意外退出后自动恢复（面板手动停止后不再自动拉起）'),
+  autoSyncDshProvider: Schema.boolean()
+    .default(true)
+    .description('插件加载就绪后，是否全自动将网关模型对齐并写入 DSH 官方模型提供商配置（完全开箱即用，免手动导入）'),
   watchdogIntervalMs: Schema.number().default(60000).description('看门狗检查间隔（毫秒）'),
   proxyUrl: Schema.string()
     .default('auto')
@@ -287,7 +290,7 @@ export const LEGACY_SETTINGS_NS = 'agy-gateway'
 const LLM_NAMESPACE = 'llm-pi-ai'
 
 /** 可由界面编辑的字段白名单（routePrefix 改动需要重启，故只读）。 */
-const EDITABLE_FIELDS = ['port', 'releaseVersion', 'allowRemoteControl', 'autoStart', 'proxyUrl', 'probeTimeoutMs', 'startTimeoutMs', 'binPath', 'configPath', 'statePath', 'authDir', 'downloadDir', 'enableZCode', 'zcodePort', 'zcodeStandalone']
+const EDITABLE_FIELDS = ['port', 'releaseVersion', 'allowRemoteControl', 'autoStart', 'autoSyncDshProvider', 'proxyUrl', 'probeTimeoutMs', 'startTimeoutMs', 'binPath', 'configPath', 'statePath', 'authDir', 'downloadDir', 'enableZCode', 'zcodePort', 'zcodeStandalone']
 
 // Gemini 上游（Vertex thinking_level）没有 xhigh 档，CLIProxyAPI 会原样透传并被 400 拒绝：
 // 选择器里保留 Xhigh 档但发送值一律钳到 high；没配档位表的 gemini 模型补一份安全默认。
@@ -303,6 +306,68 @@ function sanitizeEfforts(model) {
     return { ...model, reasoningEfforts: next }
   }
   return { ...model, reasoningEfforts: { ...GEMINI_SAFE_EFFORTS } }
+}
+
+/**
+ * 合并模型清单：保证网关真实模型存在，同时永久保留 1M 巨幕版等自定义变体与已有模型个性化配置。
+ */
+function mergeGatewayModels(existingModels, modelIds, isExplicitOverride = false) {
+  const byId = new Map((Array.isArray(existingModels) ? existingModels : []).map((m) => [String(m?.id), m]))
+  const result = []
+  const seen = new Set()
+
+  for (const id of modelIds) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    const existing = byId.get(id)
+    if (existing) {
+      result.push(sanitizeEfforts(existing))
+    } else {
+      result.push(sanitizeEfforts({
+        id,
+        contextWindow: 1000000,
+        input: ['text', 'image'],
+      }))
+    }
+    // 特殊关照：如果不是显式指定子集，且包含 gemini-3.8-flash-high，自动确保 1M 巨幕版变体紧随其后且永不丢失
+    if (!isExplicitOverride && id === 'gemini-3.8-flash-high') {
+      const variantId = 'gemini-3.8-flash-high()'
+      if (!seen.has(variantId)) {
+        seen.add(variantId)
+        const existingVariant = byId.get(variantId)
+        if (existingVariant) {
+          result.push(sanitizeEfforts(existingVariant))
+        } else {
+          result.push(sanitizeEfforts({
+            id: variantId,
+            name: 'Gemini 3.8 Flash（1M 巨幕版）',
+            contextWindow: 1000000,
+            input: ['text', 'image'],
+            reasoningEfforts: {
+              off: 'low',
+              minimal: 'low',
+              low: 'low',
+              medium: 'medium',
+              high: 'high',
+              xhigh: 'high',
+            },
+          }))
+        }
+      }
+    }
+  }
+
+  // 如果不是显式指定子集，保留用户在 settings.yaml 中配置的其他变体与自定义模型（不被覆盖冲掉）
+  if (!isExplicitOverride) {
+    for (const m of (Array.isArray(existingModels) ? existingModels : [])) {
+      if (m?.id && !seen.has(String(m.id))) {
+        seen.add(String(m.id))
+        result.push(sanitizeEfforts(m))
+      }
+    }
+  }
+
+  return result
 }
 
 /** 跨字段校验：schema 表达不了的约束在这里拒绝写入（而不是等下次使用才炸）。 */
@@ -543,6 +608,76 @@ export function apply(ctx, initialConfig) {
     clearRuntime()
     const stopped = !pidAlive(pid) && !(await isReady())
     return { stopped, pid, adoptedExternal: adopted, stillAlive: !stopped }
+  }
+
+  /**
+   * 零感自动对齐：自动将网关与 ZCode 提供商写入 DSH 官方模型配置（免手动导入）
+   */
+  async function autoSyncDshProvidersQuietly(reason = 'boot') {
+    if (config.autoSyncDshProvider === false) return
+    const settings = settingsOf()
+    if (typeof settings?.update !== 'function' || typeof settings?.get !== 'function') return
+    const credentials = credentialsOf()
+    if (typeof credentials?.set !== 'function') return
+
+    // 1. 同步网关 provider (agy-gateway)
+    try {
+      const state = readState()
+      if (state?.apiKey && (await isReady())) {
+        const modelIds = await gatewayModelIds()
+        if (Array.isArray(modelIds) && modelIds.length > 0) {
+          const providerId = String(config.dshProviderId ?? 'agy-gateway')
+          const api = String(config.dshProviderApi ?? 'openai-completions')
+          const refName = credentialRefNameOf()
+          await credentials.set(await toCredentialRef(refName), state.apiKey)
+
+          let existingModels = []
+          try {
+            existingModels = settings.get(LLM_NAMESPACE)?.providers?.[providerId]?.models ?? []
+          } catch {}
+          const finalModels = mergeGatewayModels(existingModels, modelIds, false)
+          const provider = {
+            api,
+            baseURL: `${base()}/v1`,
+            apiKeyEnv: refName,
+            defaultContextWindow: 1000000,
+            defaultInput: ['text', 'image'],
+            compat: { thinkingFormat: 'openai' },
+            models: finalModels,
+          }
+          await settings.update(LLM_NAMESPACE, { providers: { [providerId]: provider } })
+          ctx.logger?.info?.(`[ai-gateway] 已自动对齐 DSH 模型提供商（${providerId}：${finalModels.length} 个模型，含 1M 巨幕版，免手动导入）[${reason}]`)
+        }
+      }
+    } catch (err) {
+      /* 静默对齐失败不阻断加载 */
+    }
+
+    // 2. 如果开启了 ZCode，顺手自动对齐 ZCode 提供商 (zcode-gateway)
+    if (config.enableZCode !== false) {
+      try {
+        const zcCreds = loadZCodeCredentials()
+        if (zcCreds?.apiKey) {
+          const zcodePort = config.zcodePort ?? 8325
+          const zcodeBaseURL = config.zcodeStandalone !== false ? `http://127.0.0.1:${zcodePort}/v1` : `${base()}${prefix}/zcode/v1`
+          const zcodeProviderId = 'zcode-gateway'
+          const zcodeRef = 'ZCODE_GATEWAY_API_KEY'
+          await credentials.set(await toCredentialRef(zcodeRef), zcCreds.apiKey)
+
+          const zcodeModels = listSupportedGlmModels()
+          const providerDef = {
+            api: 'openai-completions',
+            baseURL: zcodeBaseURL,
+            apiKeyEnv: zcodeRef,
+            compat: { thinkingFormat: 'openai' },
+            models: zcodeModels,
+          }
+          await settings.update(LLM_NAMESPACE, { providers: { [zcodeProviderId]: providerDef } })
+        }
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   function startLogin(targetProvider = 'antigravity') {
@@ -1081,12 +1216,15 @@ export function apply(ctx, initialConfig) {
           try {
             existingModels = settings.get(LLM_NAMESPACE)?.providers?.[providerId]?.models ?? []
           } catch {}
-          const byId = new Map((Array.isArray(existingModels) ? existingModels : []).map((m) => [String(m?.id), m]))
+          const finalModels = mergeGatewayModels(existingModels, modelIds, Boolean(override))
           const provider = {
             api,
             baseURL: `${base()}/v1`,
             apiKeyEnv: refName,
-            models: modelIds.map((id) => sanitizeEfforts(byId.get(id) ?? { id })),
+            defaultContextWindow: 1000000,
+            defaultInput: ['text', 'image'],
+            compat: { thinkingFormat: 'openai' },
+            models: finalModels,
           }
           try {
             // update 是深合并：只动 providers.<id>，其它 provider 与字段不受影响；合并后过 schema 校验，形状不对存不进去
@@ -1313,7 +1451,10 @@ export function apply(ctx, initialConfig) {
     }, true)
 
     // 插件加载后稍等再拉网关（别和 DSH 自己的启动抢资源），之后由看门狗兜底
-    const bootTimer = setTimeout(() => { void ensureRunningQuietly('plugin-load') }, 2500)
+    const bootTimer = setTimeout(async () => {
+      await ensureRunningQuietly('plugin-load')
+      await autoSyncDshProvidersQuietly('plugin-load')
+    }, 2500)
     if (typeof bootTimer.unref === 'function') bootTimer.unref()
 
     // 异步后台预热与定期对齐额度缓存，保证用户打开设置面板或底栏气泡时永远是 0ms 瞬时直出
