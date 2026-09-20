@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-ai-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 插件：AI 聚合网关可视化控制台——集成 Google Antigravity 与 OpenAI Codex 反代、多账号轮换池、5h/周额度看板与故障转移。",
   "type": "module",
   "main": "lib/index.js",
