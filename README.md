@@ -10,6 +10,32 @@ DeepSeek Harness 官方生态插件：**本地多渠道 AI 聚合反代网关可
 
 ## 核心特性
 
+### Qoder 国内版：直接登录并接入 DSH
+
+在 **设置 → AI 聚合网关 → Qoder 国内版** 点击 **「登录并接入 DSH」**，打开浏览器中的 `qoder.cn` 授权链接。登录页面支持国内版账号，授权有效期为 15 分钟。
+
+完成授权后自动添加 `qoder-gateway`；新会话中可选择 `Qoder · …` 模型。支持流式输出、推理内容、工具调用、令牌自动续期和积分池查询。模型清单、图像能力、上下文窗口和推理档位按账号返回的信息接入。
+
+- 直接在现有 DSH Node 进程中运行，无需安装喜鹊或额外启动 Qoder CLI，也不依赖 CPA 在线。
+- 默认反代地址为 `http://127.0.0.1:8327/v1`，对外提供 `/models` 与 `/chat/completions`。使用独立随机网关密钥，可在折叠的账号管理中复制。
+- 账号凭据保存在网关 `state.json` 同级的 `qoder.json`；网关密钥自动写入 DSH 凭据服务的 `QODER_GATEWAY_API_KEY`。
+- 当前界面接一个国内版账号；国际版、企业 VPC、PAT 导入和自动签到未接入面板。
+- 新功能已通过假上游隔离测试；真实账号的登录与推理仍需用户在面板授权后验证。
+
+### WorkBuddy 国内版：直接登录并接入 DSH
+
+在 **设置 → AI 聚合网关 → WorkBuddy 国内版** 点击 **「登录并接入 DSH」**，打开显示的浏览器授权链接。
+授权完成后自动添加 `workbuddy-gateway` 提供商；新会话中可选择 `WorkBuddy · …` 模型。
+无需安装或运行喜鹊，也不依赖 CLIProxyAPI 在线。复用 Magpie 社区 MIT 许可的 WorkBuddy 适配模块，固定版本为 `0.1.24`。
+
+- 浏览器登录、令牌自动续期、账号可用模型同步、积分查询；当前为一个国内版账号。
+- 在 DSH 现有 Node 进程里运行 OpenAI 兼容反代，默认 `http://127.0.0.1:8326/v1`，支持流式、非流式、推理和工具调用。
+- 面板展开「反代地址与账号管理」可复制密钥或退出登录。上游令牌不会出现在状态接口中。
+- WorkBuddy 凭据独立保存在网关 `state.json` 同级的 `workbuddy.json`。WorkBuddy 5.6+ 的桌面加密凭据不读取，使用浏览器授权。
+- 端口可通过插件配置 `workbuddyPort` 调整，修改后重启插件。
+
+这条路径已通过假上游与临时凭据的隔离测试；真实账号的授权和模型调用仍需在本机验证。
+
 ### 1. 🌐 双通道顶级模型一网打尽
 * **Google Antigravity 通道**：
   * `Gemini 3.8 Flash（262k 互切主力）` & `Gemini 3.8 Flash（1M 巨幕版）`
@@ -151,11 +177,27 @@ node tools/restart-web.mjs --yes
 * **原因**：本地代理软件开启 TUN 模式时，虚拟网卡的 Fake-IP 在转发几兆级的多轮长对话请求体时发生握手超时；
 * **解决**：插件已内置 `proxy-url: "auto"` 机制，会自动直连本地代理 HTTP 端口（如 7892/7890），绕过虚拟网卡直通出海。
 
+### 4. 上游返回 `api_error: The service is temporarily unavailable`
+* **原因**：上游服务瞬时不可用、过载或网关连接抖动，不等同于请求内容错误；
+* **解决**：当前插件会把这类 `api_error` 纳入请求级自愈，自动解冻受临时错误影响的账号并按 1s / 2s / 3s 退避重试，最多 3 次；重试耗尽后才把错误交给 DSH 显示。已经开始输出模型内容的半截流不会重复重跑，避免答案重复。
+
 ---
 
 ## 自动化测试集
 
-运行全套质量门禁（132 项全部通过）：
+运行不触碰真实账号的检查（构建、规范、边界、WorkBuddy / Qoder 协议与界面渲染）：
+
+```bash
+npm run test:isolated
+```
+
+单独检查 WorkBuddy：
+
+```bash
+npm run test:workbuddy
+```
+
+原有完整集成测试会启停本机 CLIProxyAPI，并在存在 ZCode 凭据时调用真实上游：
 
 ```bash
 npm test
@@ -163,10 +205,19 @@ npm test
 * **红线规范检查 (`redline-check`)**：21/21 项（编码格式、无 BOM、导出契约、产物完整性）
 * **极端边界测试 (`edge-case-test`)**：17/17 项（冷启、破坏性配置、陈旧 PID、哈希不符、降级回退）
 * **全功能冒烟测试 (`smoke-test`)**：84/84 项（真实网关全链路、写操作幂等、跨域拦截、凭据注入）
-* **界面渲染测试 (`client-render-test`)**：10/10 项（全状态分支、双通道卡片、高亮胶囊轨、槽位隔离）
+* **界面渲染测试 (`client-render-test`)**：含 WorkBuddy 未登录、授权等待、积分为零等分支。
+* **WorkBuddy 测试 (`workbuddy-test`)**：临时凭据、假上游；验证登录、续期、鉴权、流式与非流式工具调用、错误、DSH 接入和卸载回收。
+* **Qoder 测试 (`npm run test:qoder`)**：国内版浏览器授权、设备令牌回退、真实适配模块的 COSY 请求和 SSE 转换、上下文与推理档位、会话和任务保持、工具调用、排队恢复、令牌续期、错误脱敏及 DSH 一键接入。仅使用临时凭据与假上游。
 
 ---
 
 ## 开源许可
 
 [MIT License](LICENSE)
+
+## 鸣谢与开源致敬 (Acknowledgements & Credits)
+
+- **Qoder 国内版适配**：复用 [yetone / Magpie 社区的 Qoder 登录插件](https://github.com/magpie-community/plugins/tree/main/packages/qoder)，固定 npm 版本 `0.2.33` 并校验 SHA-512。协议继承自 [ufec/CLIProxyAPI](https://github.com/ufec/CLIProxyAPI)，均采用 MIT 许可；本地仅对适配模块增加实例级网络与取消信号注入。完整版权、许可、校验值与改动见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+- **WorkBuddy 适配**：复用 [yetone / Magpie 社区的 WorkBuddy 登录插件](https://github.com/magpie-community/plugins/tree/main/packages/workbuddy)，采用 MIT 许可，固定 npm 版本 `0.1.24`，并校验 npm SHA-512 完整性。保留其登录、续期、模型、额度与请求适配；本地仅增加实例级网络注入及可取消的登录轮询。完整许可和校验值见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- **原有聚合反代内核**：感谢 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 提供原有 Google / Codex 多账号网关能力。

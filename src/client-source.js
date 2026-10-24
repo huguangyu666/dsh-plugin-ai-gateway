@@ -86,6 +86,40 @@ function Btn({ children, onClick, disabled, ghost }) {
   }, children);
 }
 
+function SubscriptionPanel({ state, busy, onAction, label, loginMinutes }) {
+  const w = state || {};
+  const login = w.login || {};
+  const quota = w.quota;
+  const waiting = login.status === "waiting";
+  return h("div", { style: { ...S.banner, marginBottom: "18px" } },
+    h("div", { style: { fontSize: "15px", fontWeight: 600, marginBottom: "6px" } }, label + " 国内版"),
+    h("div", { style: S.row },
+      h(Dot, { on: !!w.ready }),
+      h("span", null, w.ready ? w.account : "登录后即可在 DSH 中选择 " + label + " 模型")),
+    h("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "10px" } },
+      h(Btn, { disabled: busy || waiting, onClick: () => onAction("login") }, waiting ? "等待授权中…" : w.ready ? "更换账号" : "登录并接入 DSH"),
+      w.ready ? h(Btn, { ghost: true, disabled: busy, onClick: () => onAction("apply") }, "接入 DSH") : null,
+      w.ready ? h(Btn, { ghost: true, disabled: busy, onClick: () => onAction("quota") }, "刷新积分") : null),
+    waiting ? h("div", { style: { ...S.hint, ...S.warn } },
+      "等待 " + label + " 授权（" + loginMinutes + " 分钟内有效）",
+      login.url ? h("div", { style: { marginTop: "6px" } }, h("a", { href: login.url, target: "_blank", rel: "noreferrer", style: S.link }, "打开 " + label + " 登录页面")) : null,
+      h("div", null, "完成授权后会自动接入 DSH，无需复制令牌。")) : null,
+    login.message ? h("div", { style: { ...S.hint, ...(login.status === "failed" ? S.bad : S.ok) } }, login.message) : null,
+    w.error ? h("div", { style: S.bad }, w.error) : null,
+    quota ? h("div", { style: S.hint },
+      quota.plan ? h("div", null, "套餐：" + quota.plan) : null,
+      Array.isArray(quota.windows) && quota.windows.length
+        ? quota.windows.map((w, i) => h("div", { key: i }, w.name + "：已用 " + w.display))
+        : typeof quota.remaining === "number" && typeof quota.total === "number" ? "剩余积分：" + quota.remaining + " / " + quota.total : "积分暂未获取",
+      quota.error ? h("div", { style: S.warn }, quota.error) : null) : null,
+    w.ready ? h("details", { style: { marginTop: "10px" } },
+      h("summary", { style: { cursor: "pointer", fontSize: "12px", color: DSW("label-secondary") } }, "反代地址与账号管理"),
+      h("div", { style: S.row }, h("span", { style: S.mono }, w.baseURL)),
+      h("div", { style: { display: "flex", gap: "8px" } },
+        h(Btn, { ghost: true, disabled: busy, onClick: () => onAction("key") }, "复制密钥"),
+        h(Btn, { ghost: true, disabled: busy, onClick: () => { if (window.confirm("退出 " + label + " 并清除本地登录凭据？")) onAction("logout"); } }, "退出登录"))) : null);
+}
+
 const API_PREFIX = "/ai-gateway/api";
 
 async function api(path, method, body) {
@@ -429,6 +463,24 @@ function AgyGatewaySection() {
     await load();
   }, [load]);
 
+  const subscriptionAction = useCallback(async (provider, label, action) => {
+    const labels = { login: "登录 " + label, apply: "接入 " + label, quota: "刷新 " + label + " 积分", key: "复制 " + label + " 密钥", logout: "退出 " + label };
+    setAct(labels[action]);
+    setNote("");
+    try {
+      const d = action === "apply"
+        ? await api("/provider/apply", "POST", { target: provider })
+        : await api("/" + provider + "/" + action, "POST");
+      if (action === "key") {
+        if (!d.apiKey) throw new Error("请先登录 " + label);
+        await navigator.clipboard.writeText(d.apiKey);
+        setNote(label + " 反代密钥已复制");
+      } else setNote(d.message || "完成");
+    } catch (e) { setNote(labels[action] + "：❌ " + (e.message || String(e))); }
+    setAct("");
+    await load();
+  }, [load]);
+
   const copy = useCallback(async (text, label) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -499,6 +551,8 @@ function AgyGatewaySection() {
   const modelIds = g.modelIds || [];
 
   return h("div", { style: S.wrap },
+    h(SubscriptionPanel, { state: st.workbuddy, busy, label: "WorkBuddy", loginMinutes: 5, onAction: a => subscriptionAction("workbuddy", "WorkBuddy", a) }),
+    h(SubscriptionPanel, { state: st.qoder, busy, label: "Qoder", loginMinutes: 15, onAction: a => subscriptionAction("qoder", "Qoder", a) }),
     h("div", { style: S.grid },
       h(StatCard, { label: "网关状态", value: h("span", null, h(Dot, { on: g.running }), g.running ? "运行中" : "未运行"), tone: g.running ? C_OK : C_BAD }),
       h(StatCard, { label: "可用模型", value: g.models === null ? "—" : String(g.models) }),

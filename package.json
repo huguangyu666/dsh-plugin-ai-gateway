@@ -19,6 +19,7 @@
     "cordis.patch.yml",
     "README.md",
     "HANDOFF.md",
+    "THIRD_PARTY_NOTICES.md",
     "LICENSE"
   ],
   "keywords": [
@@ -58,9 +59,13 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "prepare": "node build.mjs",
     "prepack": "node build.mjs",
-    "test": "node tools/redline-check.mjs && node tools/edge-case-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs && node tools/zcode-test.mjs",
-    "verify": "node build.mjs && node tools/redline-check.mjs && node tools/edge-case-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs && node tools/zcode-test.mjs"
+    "test": "node tools/redline-check.mjs && node tools/edge-case-test.mjs && node --test tools/workbuddy-test.mjs tools/qoder-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs && node tools/zcode-test.mjs",
+    "test:workbuddy": "node build.mjs && node --test tools/workbuddy-test.mjs && node tools/client-render-test.mjs",
+    "test:qoder": "node build.mjs && node --test tools/qoder-test.mjs && node tools/client-render-test.mjs",
+    "test:isolated": "node build.mjs && node tools/redline-check.mjs && node tools/edge-case-test.mjs && node --test tools/workbuddy-test.mjs tools/qoder-test.mjs && node tools/client-render-test.mjs",
+    "verify": "node build.mjs && node tools/redline-check.mjs && node tools/edge-case-test.mjs && node --test tools/workbuddy-test.mjs tools/qoder-test.mjs && node tools/smoke-test.mjs && node tools/client-render-test.mjs && node tools/zcode-test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh": ">=0.1.2-rc.1",

@@ -4,6 +4,27 @@
 
 ---
 
+## 2026-10-24：Qoder 国内版接入
+
+- 新增 `src/qoder-service.js` 与固定为 `0.2.33` 的 `src/vendor/qoder.mjs`，使用 Magpie 社区 MIT 适配模块；保留其 CLIProxyAPI 上游版权。npm SHA-512 已核验，见 `THIRD_PARTY_NOTICES.md`。
+- Qoder 与 WorkBuddy 的登录生命周期、鉴权本地端口、凭据存储及 SSE 转发共用 `src/subscription-service.js`。两个账号和密钥各自独立；新增错误消息/流式错误脱敏和上游重试间隔转发。
+- Qoder 国内版通过 `qoder.cn` 的 PKCE 设备授权，账户 API 为 `openapi.qoder.com.cn`，模型 API 为 `gateway.qoder.com.cn`。授权等待最多 15 分钟；默认端口 `127.0.0.1:8327`，凭据为网关 `state.json` 同级的 `qoder.json`。
+- 面板新增「Qoder 国内版」；登录完成自动写 `qoder-gateway`，网关密钥存入 DSH 凭据服务。不启动额外进程，不要求 CPA 在线。账号模型、图像能力、推理档位与窗口由上游返回；额度展示各积分池的已用量。
+- 真实适配模块配合假上游验证浏览器授权、设备令牌回退、COSY 编码、SSE、工具往返、会话及任务标识、排队恢复、续期、脱敏和资源回收。WorkBuddy 原有测试继续覆盖共用接入层。
+- 验证命令为 `npm run test:isolated`（77 项）；未执行会重启真实网关/消费真实账户的 CPA 与 ZCode 集成脚本。**Qoder 真实账号尚未授权，也未进行真实推理；未主动重启 DSH。**
+
+---
+
+## 2026-10-18：WorkBuddy 国内版接入
+
+- 本次新增 `src/workbuddy-service.js`，复用 `src/vendor/workbuddy.mjs` 中固定为 `0.1.24` 的 Magpie 社区 MIT 适配模块。npm SHA-512 已校验，来源、补丁范围与许可见 `THIRD_PARTY_NOTICES.md`。
+- 不启动 Magpie。WorkBuddy 反代在现有 DSH Node 进程内运行，登录后监听 `127.0.0.1:8326`，需独立随机密钥；凭据为网关 `state.json` 同级的 `workbuddy.json`。
+- 控制台顶部新增「WorkBuddy 国内版」：浏览器授权后自动写入 `workbuddy-gateway`，密钥存入 DSH 凭据服务。可刷新积分、复制反代密钥、退出登录。当前只接一个国内版账号。
+- 使用真实适配模块、假上游和临时凭据验证登录、并发续期、模型元数据、积分、鉴权、流式与非流式工具调用、业务错误和生命周期；另已核对本机 DSH 模型配置 schema。
+- 本次执行 `npm run test:isolated`；原有 CPA / ZCode 实网集成测试未执行。**WorkBuddy 真实账号尚未授权，也未进行真实推理调用。** 下方旧版产线状态与测试数量属于原有 Google / Codex / ZCode 路径。
+
+---
+
 ## 一句话状态
 
 **已彻底闭环并在产线稳定运行。**  

@@ -236,6 +236,42 @@ const scenarios = [
     expect: ['未获得凭据'],
   },
   {
+    label: 'WorkBuddy 国内版未登录：直接提供登录入口',
+    slot: SECTION,
+    states: [{ ...baseStatus, workbuddy: { ready: false, login: { status: 'idle' } } }, null, null, null, null, null, null, null, '', '', ''],
+    expect: ['WorkBuddy 国内版', '登录并接入 DSH'],
+  },
+  {
+    label: 'WorkBuddy 等待授权：提供国内版授权链接',
+    slot: SECTION,
+    states: [{ ...baseStatus, workbuddy: { ready: false, login: { status: 'waiting', url: 'https://www.codebuddy.cn/login?state=fixture' } } }, null, null, null, null, null, null, null, '', '', ''],
+    expect: ['等待 WorkBuddy 授权', 'https://www.codebuddy.cn/login?state=fixture'],
+  },
+  {
+    label: 'WorkBuddy 已登录：展示账号与真实积分，不显示假默认余额',
+    slot: SECTION,
+    states: [{ ...baseStatus, workbuddy: { ready: true, account: '国内测试账号', running: true, baseURL: 'http://127.0.0.1:8326/v1', login: { status: 'success', message: '已接入 DSH' }, quota: { remaining: 0, total: 100, percent: 0 } } }, null, null, null, null, null, null, null, '', '', ''],
+    expect: ['国内测试账号', '剩余积分：0 / 100', '刷新积分', '复制密钥'],
+  },
+  {
+    label: 'Qoder 国内版未登录：提供一键登录入口',
+    slot: SECTION,
+    states: [{ ...baseStatus, qoder: { ready: false, login: { status: 'idle' } } }, null, null, null, null, null, null, null, '', '', ''],
+    expect: ['Qoder 国内版', '登录并接入 DSH'],
+  },
+  {
+    label: 'Qoder 等待授权：提供国内版浏览器授权链接',
+    slot: SECTION,
+    states: [{ ...baseStatus, qoder: { ready: false, login: { status: 'waiting', url: 'https://qoder.cn/device/selectAccounts?nonce=fixture' } } }, null, null, null, null, null, null, null, '', '', ''],
+    expect: ['等待 Qoder 授权', '15 分钟', 'https://qoder.cn/device/selectAccounts?nonce=fixture'],
+  },
+  {
+    label: 'Qoder 已登录：展示各积分池和上游错误',
+    slot: SECTION,
+    states: [{ ...baseStatus, qoder: { ready: true, account: 'Qoder 测试账号', baseURL: 'http://127.0.0.1:8327/v1', quota: { plan: 'Pro', windows: [{ name: 'Credits', used: 25, display: '25 / 100 credits' }], error: 'fixture quota unavailable' } } }, null, null, null, null, null, null, null, '', '', ''],
+    expect: ['Qoder 测试账号', '25 / 100 credits', 'fixture quota unavailable', '复制密钥'],
+  },
+  {
     label: '状态条：自己的卡片（运行中）',
     slot: CARD,
     props: { provider: { id: 'agy-gateway' } },

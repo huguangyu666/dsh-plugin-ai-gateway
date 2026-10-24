@@ -16,6 +16,8 @@ import Schema from '@deepseek-ai/schemastery'
 import { defaultPaths, inspectTextFile, writeHardenedConfig, resolveProxyUrlSync, syncProxyUrlInConfigFile } from './config-writer.js'
 import { summarizeUsage } from './usage-summary.js'
 import { fetchAllAccountsQuota, consumeCodexResetCredit, parseQuotaExhausted, recordRateLimitSignal } from './quota-service.js'
+import { createWorkBuddyService, DEFAULT_WORKBUDDY_PORT } from './workbuddy-service.js'
+import { createQoderService, DEFAULT_QODER_PORT } from './qoder-service.js'
 import {
   loadZCodeCredentials,
   listSupportedGlmModels,
@@ -65,6 +67,8 @@ export const Config = Schema.object({
   enableZCode: Schema.boolean().default(false).description('是否启用 ZCode / GLM 本地反代能力'),
   zcodePort: Schema.number().default(8325).description('ZCode 本地独立反代端口'),
   zcodeStandalone: Schema.boolean().default(false).description('是否启动独立本地端口服务供外部客户端连接'),
+  workbuddyPort: Schema.number().default(DEFAULT_WORKBUDDY_PORT).description('WorkBuddy 国内版本地反代端口（修改后重启插件）'),
+  qoderPort: Schema.number().default(DEFAULT_QODER_PORT).description('Qoder 国内版本地反代端口（修改后重启插件）'),
 })
 
 // ---------------------------------------------------------------- 基础读取
@@ -490,6 +494,69 @@ export function apply(ctx, initialConfig) {
   }
   const readState = () => readJSON(config.statePath)
 
+  // WorkBuddy 使用现有 Node 宿主与独立凭据文件，不启动 Magpie 或修改 CPA 配置。
+  let workbuddy = null
+  const workbuddyOf = () => {
+    workbuddy ??= createWorkBuddyService({
+      statePath: join(dirname(config.statePath), 'workbuddy.json'),
+      port: config.workbuddyPort ?? DEFAULT_WORKBUDDY_PORT,
+      onLogin: applyWorkBuddyProvider,
+    })
+    return workbuddy
+  }
+  async function applyWorkBuddyProvider() {
+    return applySubscriptionProvider(workbuddyOf(), 'workbuddy-gateway', 'WorkBuddy', 'WORKBUDDY_GATEWAY_API_KEY')
+  }
+  let qoder = null
+  const qoderOf = () => {
+    qoder ??= createQoderService({
+      statePath: join(dirname(config.statePath), 'qoder.json'),
+      port: config.qoderPort ?? DEFAULT_QODER_PORT,
+      onLogin: applyQoderProvider,
+    })
+    return qoder
+  }
+  async function applyQoderProvider() {
+    return applySubscriptionProvider(qoderOf(), 'qoder-gateway', 'Qoder', 'QODER_GATEWAY_API_KEY')
+  }
+  async function applySubscriptionProvider(service, providerId, label, ref) {
+    const settings = settingsOf(), credentials = credentialsOf()
+    if (typeof settings?.update !== 'function' || typeof credentials?.set !== 'function') {
+      throw new Error('DSH 设置或凭据服务未就绪')
+    }
+    const { baseURL } = await service.start()
+    const models = await service.models({ fresh: true })
+    if (!models.length) throw new Error(`${label} 未返回可用模型`)
+    await credentials.set(await toCredentialRef(ref), service.apiKey())
+    await settings.update(LLM_NAMESPACE, { providers: { [providerId]: {
+      api: 'openai-completions', baseURL, apiKeyEnv: ref,
+      defaultContextWindow: 128000, defaultInput: ['text'], compat: { thinkingFormat: 'openai' },
+      models: models.map(m => ({ ...m, name: `${label} · ${m.name}` })),
+    } } })
+    return { ok: true, providerId, baseURL, models: models.length,
+      message: `${label} 国内版已接入 DSH（${models.length} 个模型），开一个新会话即可选择` }
+  }
+  ctx.effect(() => {
+    const boot = setTimeout(() => {
+      try {
+        const service = workbuddyOf()
+        if (service.status().ready) void service.start().catch(err => ctx.logger?.warn?.(`[workbuddy] ${err.message}`))
+      } catch (err) { ctx.logger?.warn?.(`[workbuddy] ${err.message}`) }
+    }, 1000)
+    boot.unref?.()
+    return () => { clearTimeout(boot); return workbuddy?.close() }
+  })
+  ctx.effect(() => {
+    const boot = setTimeout(() => {
+      try {
+        const service = qoderOf()
+        if (service.status().ready) void service.start().catch(err => ctx.logger?.warn?.(`[qoder] ${err.message}`))
+      } catch (err) { ctx.logger?.warn?.(`[qoder] ${err.message}`) }
+    }, 1000)
+    boot.unref?.()
+    return () => { clearTimeout(boot); return qoder?.close() }
+  })
+
   /** 登录流程状态（内存态，进程重启后回到 idle）。 */
   const login = { status: 'idle', url: null, startedAt: null, finishedAt: null, message: null, accountsBefore: 0, child: null }
 
@@ -821,6 +888,10 @@ export function apply(ctx, initialConfig) {
       }
     }
     out.zcode = zcodeInfo
+    try { out.workbuddy = workbuddyOf().status() }
+    catch (err) { out.workbuddy = { ready: false, running: false, error: err.message } }
+    try { out.qoder = qoderOf().status() }
+    catch (err) { out.qoder = { ready: false, running: false, error: err.message } }
     return out
   }
 
@@ -869,6 +940,10 @@ export function apply(ctx, initialConfig) {
         .replace(/\/+$/, '') || '/'
       const method = req.method ?? 'GET'
 
+      // WorkBuddy 登录状态和积分只提供给获准管理此宿主的客户端。
+      if (sub.startsWith('/workbuddy/') && !controlAllowed) return sendJSON(res, 403, { error: '当前宿主未允许远程管理 WorkBuddy' })
+      if (sub.startsWith('/qoder/') && !controlAllowed) return sendJSON(res, 403, { error: '当前宿主未允许远程管理 Qoder' })
+
       // ---- ZCode 反向代理路由匹配 (/zcode/* 或 /zcode/v1/*) ----
       if (config.enableZCode !== false && (sub === '/zcode' || sub.startsWith('/zcode/'))) {
         const zSub = sub.slice('/zcode'.length) || '/'
@@ -878,6 +953,10 @@ export function apply(ctx, initialConfig) {
 
       // —— 只读 ——
       if (method === 'GET') {
+        if (sub === '/workbuddy/status') return sendJSON(res, 200, workbuddyOf().status())
+        if (sub === '/workbuddy/quota') return sendJSON(res, 200, await workbuddyOf().quota({ fresh: url.searchParams.get('fresh') === '1' }))
+        if (sub === '/qoder/status') return sendJSON(res, 200, qoderOf().status())
+        if (sub === '/qoder/quota') return sendJSON(res, 200, await qoderOf().quota({ fresh: url.searchParams.get('fresh') === '1' }))
         if (sub === '/' || sub === '/status') return sendJSON(res, 200, await collect())
         if (sub === '/models') {
           const st = readState()
@@ -1038,6 +1117,20 @@ export function apply(ctx, initialConfig) {
             return {}
           }
         })()
+        if (sub === '/workbuddy/login') return sendJSON(res, 200, { ...await workbuddyOf().beginLogin(), message: '请打开下方 WorkBuddy 授权链接，完成后会自动接入 DSH' })
+        if (sub === '/workbuddy/quota') return sendJSON(res, 200, { quota: await workbuddyOf().quota({ fresh: true }), message: '积分已刷新' })
+        if (sub === '/workbuddy/key') return sendJSON(res, 200, { apiKey: workbuddyOf().apiKey() || null })
+        if (sub === '/workbuddy/logout') {
+          await workbuddyOf().logout()
+          return sendJSON(res, 200, { ok: true, message: '已退出 WorkBuddy，本地登录凭据已清除' })
+        }
+        if (sub === '/qoder/login') return sendJSON(res, 200, { ...await qoderOf().beginLogin(), message: '请打开下方 Qoder 国内版授权链接，完成后会自动接入 DSH' })
+        if (sub === '/qoder/quota') return sendJSON(res, 200, { quota: await qoderOf().quota({ fresh: true }), message: '积分已刷新' })
+        if (sub === '/qoder/key') return sendJSON(res, 200, { apiKey: qoderOf().apiKey() || null })
+        if (sub === '/qoder/logout') {
+          await qoderOf().logout()
+          return sendJSON(res, 200, { ok: true, message: '已退出 Qoder，本地登录凭据已清除' })
+        }
         if (sub === '/gateway/start') {
           userStopped = false
           return sendJSON(res, 200, await ensureRunning())
@@ -1138,6 +1231,14 @@ export function apply(ctx, initialConfig) {
           }
         }
         if (sub === '/provider/apply') {
+          if (body?.target === 'qoder') {
+            try { return sendJSON(res, 200, await applyQoderProvider()) }
+            catch (err) { return sendJSON(res, 400, { error: err.message }) }
+          }
+          if (body?.target === 'workbuddy') {
+            try { return sendJSON(res, 200, await applyWorkBuddyProvider()) }
+            catch (err) { return sendJSON(res, 400, { error: err.message }) }
+          }
           const settings = settingsOf()
           if (typeof settings?.update !== 'function' || typeof settings?.get !== 'function') {
             return sendJSON(res, 503, { error: '设置服务未挂载或不可写，无法写 provider' })
@@ -1407,6 +1508,9 @@ export function apply(ctx, initialConfig) {
 
       const msg = String(failure?.message || '')
       const code = String(failure?.code || '')
+      const msgLower = msg.toLowerCase()
+      const codeLower = code.toLowerCase()
+      const status = Number(failure?.status ?? failure?.statusCode ?? failure?.response?.status)
 
       // 额度耗尽（429）：官方账本是异步批处理的，实测会滞后于真实消耗
       // （出现过面板 100% 但请求已 QUOTA_EXHAUSTED）。真实报文里的
@@ -1428,6 +1532,13 @@ export function apply(ctx, initialConfig) {
         return next ? next() : Promise.resolve(void 0)
       }
 
+      const transientApiError = (codeLower === 'api_error' || msgLower.startsWith('api_error'))
+        && (msgLower.includes('temporarily unavailable')
+          || msgLower.includes('service unavailable')
+          || msgLower.includes('try again')
+          || msgLower.includes('overloaded'))
+      const transientHttpStatus = [408, 425, 500, 502, 503, 504].includes(status)
+
       const isConnectionOrServerError = msg.includes('Connection error')
         || msg.includes('ECONNREFUSED')
         || msg.includes('connectex')
@@ -1441,6 +1552,8 @@ export function apply(ctx, initialConfig) {
         || msg.includes('server_error')
         || code === 'SERVER'
         || code === 'TIMEOUT'
+        || transientApiError
+        || transientHttpStatus
 
       if (!isConnectionOrServerError) {
         return next ? next() : Promise.resolve(void 0)
